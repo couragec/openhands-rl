@@ -32,10 +32,10 @@ class Config:
     output_path: Optional[str] = field(default_factory=lambda: os.environ.get("OUTPUT_DIR"))
     model_path: Optional[str] = field(default_factory=lambda: os.environ.get("MODEL_PATH"))
     
-    # LLM 配置
-    llm_model: str = field(default_factory=lambda: os.environ.get("LLM_MODEL", "gpt-4o"))
-    llm_api_key: str = field(default_factory=lambda: os.environ.get("LLM_API_KEY", ""))
-    llm_base_url: Optional[str] = field(default_factory=lambda: os.environ.get("LLM_BASE_URL"))
+    # LLM 配置（支持 LLM_API_KEY 或 OPENAI_API_KEY）
+    llm_model: str = field(default_factory=lambda: os.environ.get("LLM_MODEL", os.environ.get("CHAT_MODEL", "gpt-4o")))
+    llm_api_key: str = field(default_factory=lambda: os.environ.get("LLM_API_KEY", os.environ.get("OPENAI_API_KEY", "")))
+    llm_base_url: Optional[str] = field(default_factory=lambda: os.environ.get("LLM_BASE_URL", os.environ.get("OPENAI_API_BASE")))
     
     # Pipeline 配置
     max_iterations: int = field(default_factory=lambda: int(os.environ.get("MAX_ITERATIONS", "50")))
