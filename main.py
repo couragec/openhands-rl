@@ -1,161 +1,230 @@
 #!/usr/bin/env python3
 """
-OpenHands RL Post-training Pipeline
+OpenHands RL Post-training Agent
 
-使用 OpenHands SDK 自动化 RL 后训练流程：
-1. 分析任务和数据
-2. 设计 reward function
-3. 使用 trl 进行 GRPO/PPO 训练
-4. 评测并迭代优化
+简单实现：让 OpenHands Agent 自主完成 RL 后训练任务。
+参考 openhands-magic 的模式。
 """
 
 import argparse
-import json
 import os
-import sys
-from datetime import datetime
 from pathlib import Path
 
-import yaml
-from litellm import completion
 from pydantic import SecretStr
 
 from openhands.sdk import LLM, Agent, Conversation, Tool
 from openhands.tools.file_editor import FileEditorTool
 from openhands.tools.terminal import TerminalTool
 
-from config import Config
-from tools.trl_training import TRLTrainingTool
-from tools.benchmark_eval import BenchmarkEvalTool
 
-
-def create_agent(config: Config, llm: LLM) -> Agent:
-    """创建配置好工具的 Agent"""
-    tools = [
-        Tool(name=FileEditorTool.name),
-        Tool(name=TerminalTool.name),
-        Tool(name=TRLTrainingTool.name),
-        Tool(name=BenchmarkEvalTool.name),
+def load_task_description(workspace: str, task: str) -> str:
+    """加载任务描述（description.md）"""
+    # 查找 description.md
+    search_paths = [
+        Path(workspace) / "description.md",
+        Path(workspace).parent / "tasks" / task / "description.md",
     ]
-    return Agent(llm=llm, tools=tools)
+    
+    # 也检查 autorl_bench 的 tasks 目录
+    autorl_bench_path = Path(__file__).parent.parent.parent / "RD-Agent" / "rdagent" / "scenarios" / "rl" / "autorl_bench" / "tasks" / task / "description.md"
+    if autorl_bench_path.exists():
+        search_paths.insert(0, autorl_bench_path)
+    
+    for path in search_paths:
+        if path.exists():
+            return path.read_text()
+    
+    return ""
 
 
-def build_system_prompt(config: Config) -> str:
-    """构建系统 prompt"""
-    return f"""你是一个 RL 后训练专家，负责提升模型在 {config.benchmark} benchmark 上的性能。
+def load_data_preview(data_path: str, num_lines: int = 5) -> str:
+    """加载数据预览"""
+    import json
+    
+    path = Path(data_path)
+    if not path.exists():
+        # 尝试在 data 目录下查找
+        return f"数据路径: {data_path}"
+    
+    try:
+        lines = []
+        with open(path) as f:
+            for i, line in enumerate(f):
+                if i >= num_lines:
+                    break
+                if line.strip():
+                    lines.append(json.loads(line))
+        return json.dumps(lines, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return f"无法读取数据: {e}"
 
-## 环境信息
-- 基础模型: {config.base_model}
-- 数据目录: {config.data_path}
-- 输出目录: {config.output_path}
-- Benchmark: {config.benchmark}
 
-## 可用工具
-1. FileEditorTool: 读写文件
-2. TerminalTool: 执行命令
-3. TRLTrainingTool: 使用 trl 库进行 RL 训练
-4. BenchmarkEvalTool: 评测模型性能
+def create_agent(llm: LLM) -> Agent:
+    """创建 Agent"""
+    return Agent(
+        llm=llm,
+        tools=[
+            Tool(name=FileEditorTool.name),
+            Tool(name=TerminalTool.name, params={"no_change_timeout_seconds": 600}),
+        ],
+    )
+
+
+def build_task_prompt(
+    task: str,
+    base_model: str,
+    workspace: str,
+    task_description: str,
+    data_preview: str,
+    grading_server_url: str,
+) -> str:
+    """构建任务 Prompt"""
+    return f"""你是一个 RL 后训练专家。请完成以下任务：
+
+## 任务信息
+- Benchmark: {task}
+- 基础模型: {base_model}
+- Workspace: {workspace}
+- 数据目录: {workspace}/data/{task}
+- 模型目录: {workspace}/models/{base_model}
+- 输出目录: {workspace}/output
+
+## 任务描述
+{task_description if task_description else "请分析数据格式并设计训练策略。"}
+
+## 数据预览
+```json
+{data_preview}
+```
+
+## 评测说明
+训练完成后，请将模型保存到 {workspace}/output 目录。
+评测会通过 Grading Server ({grading_server_url}) 自动进行。
+
+你可以通过 HTTP 请求提交评测：
+```bash
+curl -X POST {grading_server_url}/submit -H "Content-Type: application/json" -d '{{"model_path": "{workspace}/output"}}'
+```
 
 ## 训练框架
-使用 trl 库 (版本 >= 0.27.0)，推荐算法：
-- **GRPO**: 推荐，适合数学推理，不需要偏好对
-- DPO: 需要 (chosen, rejected) 偏好对
-- PPO/RLOO: 其他选择
+使用 trl 库 (版本 >= 0.27.0)，推荐 GRPO 算法：
+
+```python
+from trl import GRPOConfig, GRPOTrainer
+
+trainer = GRPOTrainer(
+    model=model,
+    reward_funcs=reward_fn,
+    args=GRPOConfig(...),
+    train_dataset=dataset,
+    processing_class=tokenizer,
+)
+trainer.train()
+model.save_pretrained("./output")
+tokenizer.save_pretrained("./output")
+```
 
 ## 任务流程
-1. 分析数据格式和任务特点
-2. 设计合适的 reward function
-3. 编写训练脚本 (使用 GRPOTrainer)
-4. 训练并保存模型到 {config.output_path}
-5. 使用 BenchmarkEvalTool 评测
-6. 根据结果迭代优化
+1. 分析数据格式（查看 data 目录下的 train.jsonl）
+2. 设计 reward function
+3. 编写训练脚本
+4. 执行训练
+5. 保存模型到 output 目录
+6. 提交评测
 
-## 注意事项
-- 训练完成后必须保存模型到 output 目录
-- 每次只改动一个变量，便于归因
-- 关注 GPU 内存使用，避免 OOM
+请开始执行任务。
 """
 
 
-def build_task_prompt(config: Config, history: list = None) -> str:
-    """构建任务 prompt"""
-    history_str = ""
-    if history:
-        history_str = "\n## 历史实验\n"
-        for exp in history[-5:]:  # 只保留最近 5 次
-            history_str += f"- 配置: {exp.get('config', 'N/A')}\n"
-            history_str += f"  分数: {exp.get('score', 'N/A')}\n"
-    else:
-        history_str = "\n## 历史实验\n无（首次运行）\n"
-    
-    return f"""## 当前任务
-请为 {config.benchmark} benchmark 设计并执行 RL 后训练。
-
-{history_str}
-
-请开始分析数据并设计训练策略。
-"""
-
-
-def run_pipeline(config: Config):
-    """运行 RL 训练 pipeline"""
+def run_pipeline(
+    task: str,
+    base_model: str,
+    workspace: str,
+    max_iterations: int,
+):
+    """运行 Pipeline"""
     print(f"=== OpenHands RL Pipeline ===")
-    print(f"Benchmark: {config.benchmark}")
-    print(f"Model: {config.base_model}")
-    print(f"Workspace: {config.workspace}")
+    print(f"Task: {task}")
+    print(f"Model: {base_model}")
+    print(f"Workspace: {workspace}")
+    
+    # 获取配置
+    llm_api_key = os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
+    llm_model = os.environ.get("LLM_MODEL", "gpt-4o")
+    llm_base_url = os.environ.get("LLM_BASE_URL") or os.environ.get("OPENAI_API_BASE", "")
+    grading_server_url = os.environ.get("GRADING_SERVER_URL", "http://localhost:5000")
+    
+    if not llm_api_key:
+        print("ERROR: LLM_API_KEY or OPENAI_API_KEY not set")
+        return
+    
+    print(f"LLM Model: {llm_model}")
+    print(f"Grading Server: {grading_server_url}")
+    
+    # 加载任务描述
+    task_description = load_task_description(workspace, task)
+    if task_description:
+        print(f"Loaded task description ({len(task_description)} chars)")
+    
+    # 加载数据预览
+    data_path = Path(workspace) / "data" / task / "train.jsonl"
+    if not data_path.exists():
+        data_path = Path(workspace) / "data" / "train.jsonl"
+    data_preview = load_data_preview(str(data_path))
     
     # 创建 LLM
-    llm = LLM(
-        model=config.llm_model,
-        api_key=SecretStr(config.llm_api_key),
-        base_url=config.llm_base_url,
-    )
+    llm_kwargs = {
+        "model": llm_model,
+        "api_key": SecretStr(llm_api_key),
+    }
+    if llm_base_url:
+        llm_kwargs["base_url"] = llm_base_url
+    
+    llm = LLM(**llm_kwargs)
     
     # 创建 Agent
-    agent = create_agent(config, llm)
+    agent = create_agent(llm)
     
     # 创建 Conversation
     conv = Conversation(
         agent=agent,
-        workspace=config.workspace,
-        system_prompt=build_system_prompt(config),
+        workspace=workspace,
+        max_iteration_per_run=max_iterations,
     )
     
-    # 发送任务
-    task_prompt = build_task_prompt(config)
+    # 构建任务 Prompt
+    task_prompt = build_task_prompt(
+        task=task,
+        base_model=base_model,
+        workspace=workspace,
+        task_description=task_description,
+        data_preview=data_preview,
+        grading_server_url=grading_server_url,
+    )
+    
     print(f"\n--- Sending task to agent ---")
     conv.send_message(task_prompt)
     
-    # 运行
-    print(f"\n--- Running agent ---")
-    conv.run(max_iterations=config.max_iterations)
+    print(f"\n--- Running agent (max {max_iterations} iterations) ---")
+    conv.run()
     
     print(f"\n=== Pipeline completed ===")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="OpenHands RL Post-training Pipeline")
-    parser.add_argument("--config", type=str, help="Path to config YAML file")
+    parser = argparse.ArgumentParser(description="OpenHands RL Post-training Agent")
     parser.add_argument("--benchmark", type=str, default="gsm8k", help="Benchmark name")
     parser.add_argument("--base-model", type=str, default="Qwen/Qwen2.5-Coder-0.5B-Instruct")
     parser.add_argument("--workspace", type=str, default="./workspace")
     parser.add_argument("--max-iterations", type=int, default=50)
     args = parser.parse_args()
     
-    # 加载配置
-    if args.config and Path(args.config).exists():
-        with open(args.config) as f:
-            config_dict = yaml.safe_load(f)
-        config = Config(**config_dict)
-    else:
-        config = Config(
-            benchmark=args.benchmark,
-            base_model=args.base_model,
-            workspace=args.workspace,
-            max_iterations=args.max_iterations,
-        )
-    
-    run_pipeline(config)
+    run_pipeline(
+        task=args.benchmark,
+        base_model=args.base_model,
+        workspace=args.workspace,
+        max_iterations=args.max_iterations,
+    )
 
 
 if __name__ == "__main__":
