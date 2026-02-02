@@ -3,60 +3,17 @@
 OpenHands RL Post-training Agent
 
 简单实现：让 OpenHands Agent 自主完成 RL 后训练任务。
-参考 openhands-magic 的模式。
+Agent 会自己读取 workspace 里的 instructions.txt 和 description.md。
 """
 
 import argparse
 import os
-from pathlib import Path
 
 from pydantic import SecretStr
 
 from openhands.sdk import LLM, Agent, Conversation, Tool
 from openhands.tools.file_editor import FileEditorTool
 from openhands.tools.terminal import TerminalTool
-
-
-def load_task_description(workspace: str, task: str) -> str:
-    """加载任务描述（description.md）"""
-    # 查找 description.md
-    search_paths = [
-        Path(workspace) / "description.md",
-        Path(workspace).parent / "tasks" / task / "description.md",
-    ]
-    
-    # 也检查 autorl_bench 的 tasks 目录
-    autorl_bench_path = Path(__file__).parent.parent.parent / "RD-Agent" / "rdagent" / "scenarios" / "rl" / "autorl_bench" / "tasks" / task / "description.md"
-    if autorl_bench_path.exists():
-        search_paths.insert(0, autorl_bench_path)
-    
-    for path in search_paths:
-        if path.exists():
-            return path.read_text()
-    
-    return ""
-
-
-def load_data_preview(data_path: str, num_lines: int = 5) -> str:
-    """加载数据预览"""
-    import json
-    
-    path = Path(data_path)
-    if not path.exists():
-        # 尝试在 data 目录下查找
-        return f"数据路径: {data_path}"
-    
-    try:
-        lines = []
-        with open(path) as f:
-            for i, line in enumerate(f):
-                if i >= num_lines:
-                    break
-                if line.strip():
-                    lines.append(json.loads(line))
-        return json.dumps(lines, ensure_ascii=False, indent=2)
-    except Exception as e:
-        return f"无法读取数据: {e}"
 
 
 def create_agent(llm: LLM) -> Agent:
@@ -74,65 +31,45 @@ def build_task_prompt(
     task: str,
     base_model: str,
     workspace: str,
-    task_description: str,
-    data_preview: str,
-    grading_server_url: str,
 ) -> str:
-    """构建任务 Prompt"""
-    return f"""你是一个 RL 后训练专家。请完成以下任务：
+    """构建任务 Prompt - 让 agent 自主完成任务"""
+    return f"""你是一个 RL 后训练专家。你的任务是自主完成模型训练并提交评测。
 
-## 任务信息
-- Benchmark: {task}
-- 基础模型: {base_model}
+## 重要：自主执行
+- 你必须自主完成所有步骤，不要等待用户确认
+- 遇到问题自己解决，不要询问用户
+- 完成训练并提交评测后，调用 finish 工具结束
+
+## 安全限制（严格遵守）
+- 只能在 Workspace 目录下操作：{workspace}
+- 禁止读写 Workspace 以外的任何文件
+- 禁止修改环境：不允许 pip install、conda install 或任何包管理命令
+- 所有依赖已预装在 openhands 环境中，直接使用即可
+
+## 运行环境
+- Conda 环境：openhands（已激活，无需手动激活）
+- 预装库：transformers, trl, torch, vllm, datasets, accelerate, peft 等
+
+## 任务文档
+请先阅读以下文件了解详情：
+1. {workspace}/instructions.txt - 任务说明、环境变量、API 接口
+2. {workspace}/description.md - 具体任务描述和数据格式
+
+## 基本信息
 - Workspace: {workspace}
-- 数据目录: {workspace}/data/{task}
-- 模型目录: {workspace}/models/{base_model}
-- 输出目录: {workspace}/output
-
-## 任务描述
-{task_description if task_description else "请分析数据格式并设计训练策略。"}
-
-## 数据预览
-```json
-{data_preview}
-```
-
-## 评测说明
-训练完成后，请将模型保存到 {workspace}/output 目录。
-评测会通过 Grading Server ({grading_server_url}) 自动进行。
-
-你可以通过 HTTP 请求提交评测：
-```bash
-curl -X POST {grading_server_url}/submit -H "Content-Type: application/json" -d '{{"model_path": "{workspace}/output"}}'
-```
-
-## 训练框架
-使用 trl 库 (版本 >= 0.27.0)，推荐 GRPO 算法：
-
-```python
-from trl import GRPOConfig, GRPOTrainer
-
-trainer = GRPOTrainer(
-    model=model,
-    reward_funcs=reward_fn,
-    args=GRPOConfig(...),
-    train_dataset=dataset,
-    processing_class=tokenizer,
-)
-trainer.train()
-model.save_pretrained("./output")
-tokenizer.save_pretrained("./output")
-```
+- 基础模型: {base_model}
+- 训练数据: {workspace}/data/
+- 输出目录: {workspace}/output/
 
 ## 任务流程
-1. 分析数据格式（查看 data 目录下的 train.jsonl）
-2. 设计 reward function
-3. 编写训练脚本
+1. 阅读文档了解任务
+2. 分析训练数据格式
+3. 在 Workspace 中编写训练脚本（使用 trl 库的 GRPO）
 4. 执行训练
-5. 保存模型到 output 目录
-6. 提交评测
+5. 提交评测（POST grading server）
+6. 调用 finish 结束
 
-请开始执行任务。
+现在开始执行，不要等待用户输入。
 """
 
 
@@ -148,34 +85,27 @@ def run_pipeline(
     print(f"Model: {base_model}")
     print(f"Workspace: {workspace}")
     
-    # 获取配置
+    # 获取 LLM 配置
     llm_api_key = os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
-    llm_model = os.environ.get("LLM_MODEL", "gpt-4o")
+    llm_model = os.environ.get("LLM_MODEL", "gpt-5")  # 默认 gpt-5，和 sft 一致
     llm_base_url = os.environ.get("LLM_BASE_URL") or os.environ.get("OPENAI_API_BASE", "")
-    grading_server_url = os.environ.get("GRADING_SERVER_URL", "http://localhost:5000")
     
     if not llm_api_key:
         print("ERROR: LLM_API_KEY or OPENAI_API_KEY not set")
         return
     
     print(f"LLM Model: {llm_model}")
-    print(f"Grading Server: {grading_server_url}")
-    
-    # 加载任务描述
-    task_description = load_task_description(workspace, task)
-    if task_description:
-        print(f"Loaded task description ({len(task_description)} chars)")
-    
-    # 加载数据预览
-    data_path = Path(workspace) / "data" / task / "train.jsonl"
-    if not data_path.exists():
-        data_path = Path(workspace) / "data" / "train.jsonl"
-    data_preview = load_data_preview(str(data_path))
     
     # 创建 LLM
+    # 重要：设置 model_canonical_name="gpt-4" 来禁用 Responses API
+    # gpt-5 在 RESPONSES_API_MODELS 中，会触发 /responses endpoint 调用
+    # 但我们的 API proxy 的 /responses endpoint 有兼容性问题
+    # 通过设置 model_canonical_name 为非 gpt-5 模型，强制使用 completion API
     llm_kwargs = {
         "model": llm_model,
         "api_key": SecretStr(llm_api_key),
+        "prompt_cache_retention": None,  # 禁用 Azure 不支持的 prompt cache retention
+        "model_canonical_name": "gpt-4",  # 禁用 Responses API，使用 completion API
     }
     if llm_base_url:
         llm_kwargs["base_url"] = llm_base_url
@@ -192,14 +122,11 @@ def run_pipeline(
         max_iteration_per_run=max_iterations,
     )
     
-    # 构建任务 Prompt
+    # 构建任务 Prompt（简化版，让 agent 自己读取文档）
     task_prompt = build_task_prompt(
         task=task,
         base_model=base_model,
         workspace=workspace,
-        task_description=task_description,
-        data_preview=data_preview,
-        grading_server_url=grading_server_url,
     )
     
     print(f"\n--- Sending task to agent ---")
