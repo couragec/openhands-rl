@@ -32,9 +32,9 @@ def create_agent(llm: LLM, condenser_llm: LLM | None = None) -> Agent:
     # 2. max_size: 事件数量超过限制（次要限制）
     condenser = LLMSummarizingCondenser(
         llm=condenser_llm or llm,  # 复用主 LLM 或使用独立的便宜模型
-        max_size=100,       # 超过 200 个事件时触发压缩
+        max_size=100,       # 超过 100 个事件时触发压缩
         keep_first=4,       # 保留前 4 个事件（任务描述等）
-        max_tokens=100000,  # 超过 100K tokens 时触发压缩（主要限制）
+        max_tokens=30000,   # 超过 30K tokens 时触发压缩（注意：这是 messages token，不是 API 报告的 reasoning token）
     )
     
     return Agent(
@@ -133,7 +133,7 @@ def run_pipeline(
     llm = LLM(**llm_kwargs)
     
     # 创建 Agent（带 LLM Summarizing Condenser 处理长上下文）
-    print(f"Condenser: LLMSummarizingCondenser (max_tokens=100K, max_size=200, keep_first=4)")
+    print(f"Condenser: LLMSummarizingCondenser (max_tokens=30K, max_size=100, keep_first=4)")
     agent = create_agent(llm, condenser_llm=llm)
     
     # 创建 Conversation
