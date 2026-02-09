@@ -12,18 +12,34 @@ import os
 from pydantic import SecretStr
 
 from openhands.sdk import LLM, Agent, Conversation, Tool
+from openhands.sdk.context.condenser import LLMSummarizingCondenser
 from openhands.tools.file_editor import FileEditorTool
 from openhands.tools.terminal import TerminalTool
 
 
-def create_agent(llm: LLM) -> Agent:
-    """创建 Agent"""
+def create_agent(llm: LLM, condenser_llm: LLM | None = None) -> Agent:
+    """创建 Agent
+    
+    Args:
+        llm: 主 LLM，用于 agent 推理
+        condenser_llm: 用于上下文压缩的 LLM（可选，默认复用主 LLM）
+    """
+    # 创建 condenser 来处理长时间运行任务的上下文压缩
+    # 官方推荐配置：LLMSummarizingCondenser
+    condenser = LLMSummarizingCondenser(
+        llm=condenser_llm or llm,  # 复用主 LLM 或使用独立的便宜模型
+        max_size=120,      # 超过 120 个事件时触发压缩（默认 240）
+        keep_first=4,      # 保留前 4 个事件（任务描述等）
+        max_tokens=None,   # 不限制 token（由 max_size 控制）
+    )
+    
     return Agent(
         llm=llm,
         tools=[
             Tool(name=FileEditorTool.name),
             Tool(name=TerminalTool.name, params={"no_change_timeout_seconds": 600}),
         ],
+        condenser=condenser,  # 启用上下文压缩
     )
 
 
@@ -112,8 +128,9 @@ def run_pipeline(
     
     llm = LLM(**llm_kwargs)
     
-    # 创建 Agent
-    agent = create_agent(llm)
+    # 创建 Agent（带 LLM Summarizing Condenser 处理长上下文）
+    print(f"Condenser: LLMSummarizingCondenser (max_size=120, keep_first=4)")
+    agent = create_agent(llm, condenser_llm=llm)
     
     # 创建 Conversation
     conv = Conversation(
