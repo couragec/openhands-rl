@@ -72,7 +72,7 @@ def build_task_prompt(
 
 ## 任务文档
 请先阅读以下文件了解详情：
-1. {workspace}/instructions.txt - 任务说明、环境变量、API 接口
+1. {workspace}/instructions.md - 任务说明、环境变量、API 接口
 2. {workspace}/description.md - 具体任务描述和数据格式
 
 ## 基本信息
