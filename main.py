@@ -70,23 +70,19 @@ def build_task_prompt(
 - Conda 环境：openhands（已激活，无需手动激活）
 - 预装库：transformers, trl, torch, vllm, datasets, accelerate, peft 等
 
-## 任务文档
-请先阅读以下文件了解详情：
-1. {workspace}/instructions.md - 任务说明、环境变量、API 接口
-2. {workspace}/description.md - 具体任务描述和数据格式
-
-## 基本信息
-- Workspace: {workspace}
-- 基础模型: {base_model}
-- 训练数据: {workspace}/data/
-- 输出目录: {workspace}/output/
+## 目录结构
+- 代码区: {workspace}/code/ — 所有自行编写的代码放在此处
+- 训练数据: {workspace}/data/（只读）
+- 基础模型: {workspace}/models/（只读，{base_model}）
+- 模型输出: {workspace}/output/ — 训练好的模型保存在此
+- 任务说明: {workspace}/instructions.md, {workspace}/description.md
 
 ## 任务流程
-1. 阅读文档了解任务
-2. 分析训练数据格式
-3. 在 Workspace 中编写训练脚本（使用 trl 库的 GRPO）
-4. 执行训练
-5. 提交评测（POST grading server）
+1. 阅读 {workspace}/instructions.md 和 {workspace}/description.md 了解任务
+2. 在 {workspace}/code/ 下编写训练脚本（使用 trl 库的 GRPO）
+3. 执行训练，模型保存到 {workspace}/output/
+4. 提交评测：POST $GRADING_SERVER_URL/submit，指定 model_path
+5. 根据 score 反馈迭代优化，可多次提交不同版本
 6. 调用 finish 结束
 
 现在开始执行，不要等待用户输入。
