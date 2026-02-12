@@ -254,9 +254,9 @@ def build_code_prompt(
     grpo_template = ""
     if iteration == 1:
         grpo_template = """
-## GRPO 参考代码模板（TRL 0.27+）
+## GRPO 参考代码模板（TRL 0.28+）
 
-以下是可直接运行的最小 GRPO 训练代码，**请基于此模板修改**，不要从零开始写：
+以下是一个可参考的 GRPO 训练代码示例，可以根据需要自行调整：
 
 ```python
 import os, json, re
@@ -280,10 +280,15 @@ for item in raw:
 
 dataset = Dataset.from_dict({"prompt": prompts})
 
-# 2. Reward 函数（返回 float list，每条样本一个 reward）
-def reward_fn(completions: list[str], **kwargs) -> list[float]:
+# 2. Reward 函数
+# 注意：completions 可能是 chat 格式（list of dicts）或纯字符串，必须先提取文本
+def reward_fn(completions, **kwargs) -> list[float]:
     rewards = []
-    for text in completions:
+    for comp in completions:
+        if isinstance(comp, list):
+            text = comp[-1]["content"] if comp else ""
+        else:
+            text = str(comp)
         # 简单示例：有数字答案 +1，否则 0；请根据任务替换
         rewards.append(1.0 if re.search(r"\\d+", text) else 0.0)
     return rewards
@@ -292,8 +297,9 @@ def reward_fn(completions: list[str], **kwargs) -> list[float]:
 config = GRPOConfig(
     output_dir=OUTPUT_DIR,
     num_train_epochs=1,
-    per_device_train_batch_size=4,
+    per_device_train_batch_size=2,
     gradient_accumulation_steps=2,
+    num_generations=8,
     learning_rate=5e-6,
     max_completion_length=256,
     logging_steps=10,
@@ -320,8 +326,11 @@ print(f"Model saved to {OUTPUT_DIR}")
 
 **注意事项**：
 - TRL 版本 0.28+，GRPOTrainer 签名：`GRPOTrainer(model, reward_funcs, args, train_dataset, processing_class=tokenizer)`
-- 注意是 `processing_class` 不是 `tokenizer`，`reward_funcs` 是第二个位置参数
+- 注意是 `processing_class` 不是 `tokenizer`（旧版用 tokenizer 会报错）
+- `reward_funcs` 是第二个位置参数
+- completions 是 chat 格式（list of dicts），reward 函数里要用 `comp[-1]["content"]` 提取文本
 - prompt 必须是 chat 格式（list of dict），不是纯字符串
+- `num_generations` 必须能被 `per_device_train_batch_size * num_gpus` 整除
 - 可以先用少量样本快速验证链路能跑通，确认无误后再全量训练
 """
 
@@ -330,7 +339,7 @@ print(f"Model saved to {OUTPUT_DIR}")
         task_instruction = f"""## 你的任务（第 1 轮：链路打通）
 1. 用 terminal 快速查看数据格式：`head -3 {data_path}/train.jsonl`
 2. 阅读 {workspace}/description.md 了解任务要求
-3. **基于上面的参考代码模板**，在 {workspace}/code/ 下编写 train.py
+3. 在 {workspace}/code/ 下编写 train.py（可参考上面的代码示例）
 4. 重点工作：
    - 根据数据格式调整 prompt 构造
    - 根据任务设计 reward 函数（参考 description.md）
