@@ -28,6 +28,89 @@ from openhands.tools.terminal import TerminalTool
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def get_data_stats(data_path: str) -> dict:
+    """读取 train.jsonl，返回样本数和长度统计。"""
+    samples = []
+    path = Path(data_path)
+    jsonl = path / "train.jsonl" if path.is_dir() else path
+
+    if not jsonl.exists():
+        return {"count": 0, "avg_prompt_len": 0, "avg_answer_len": 0}
+
+    try:
+        with open(jsonl, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    samples.append(json.loads(line))
+    except Exception:
+        return {"count": 0, "avg_prompt_len": 0, "avg_answer_len": 0}
+
+    if not samples:
+        return {"count": 0, "avg_prompt_len": 0, "avg_answer_len": 0}
+
+    prompt_lens = []
+    answer_lens = []
+    for s in samples:
+        # 支持多种格式
+        prompt = s.get("prompt") or s.get("question") or s.get("instruction") or ""
+        answer = s.get("answer") or s.get("response") or s.get("output") or ""
+        prompt_lens.append(len(prompt))
+        answer_lens.append(len(answer))
+
+    return {
+        "count": len(samples),
+        "avg_prompt_len": sum(prompt_lens) // max(len(prompt_lens), 1),
+        "avg_answer_len": sum(answer_lens) // max(len(answer_lens), 1),
+    }
+
+
+def load_data_preview(data_path: str, num_samples: int = 3) -> str:
+    """返回 train.jsonl 前几条样本的 JSON 预览。"""
+    path = Path(data_path)
+    jsonl = path / "train.jsonl" if path.is_dir() else path
+
+    if not jsonl.exists():
+        return "（数据文件不存在）"
+
+    records = []
+    try:
+        with open(jsonl, "r", encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                if i >= num_samples:
+                    break
+                if line.strip():
+                    records.append(json.loads(line))
+    except Exception as e:
+        return f"（读取失败: {e}）"
+
+    return json.dumps(records, ensure_ascii=False, indent=2)
+
+
+def get_gpu_info() -> dict:
+    """获取 GPU 数量和型号。"""
+    cuda_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    num_gpus = len(cuda_devices.split(",")) if cuda_devices else 0
+
+    gpu_name = "Unknown"
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            names = [n.strip() for n in result.stdout.strip().splitlines() if n.strip()]
+            if names:
+                gpu_name = names[0]
+    except Exception:
+        pass
+
+    return {"num_gpus": num_gpus, "gpu_name": gpu_name, "cuda_devices": cuda_devices}
+
+
+# ---------------------------------------------------------------------------
 # Data Classes
 # ---------------------------------------------------------------------------
 
@@ -94,16 +177,39 @@ def build_code_prompt(
     base_model: str,
     task_description: str,
     history: list[IterationResult],
+    data_stats: dict | None = None,
+    gpu_info: dict | None = None,
 ) -> str:
     """构建代码生成阶段的 prompt
 
     关键设计：
-    - 第 1 轮：让 agent 探索数据格式 + 写初版代码
+    - 第 1 轮：给 GRPO 参考代码 + 数据统计，让 agent 快速写出能跑的代码
     - 后续轮：注入上轮结果（score/error），引导定向优化
     """
     model_path = os.environ.get("MODEL_PATH", "")
     data_path = os.environ.get("DATA_PATH", "")
     output_dir = os.environ.get("OUTPUT_DIR", "")
+
+    # ---- GPU 信息 ----
+    gpu_section = ""
+    if gpu_info:
+        gpu_section = f"""
+## 硬件环境
+- GPU: {gpu_info['num_gpus']}x {gpu_info['gpu_name']}
+- CUDA_VISIBLE_DEVICES={gpu_info['cuda_devices']}
+- Pipeline 会用 `accelerate launch` 执行你的代码，自动启用多卡 DDP，你不需要手动处理分布式
+- 参数建议：{gpu_info['num_gpus']} 卡时 per_device_train_batch_size=4, gradient_accumulation_steps=2
+"""
+
+    # ---- 数据统计 ----
+    data_stats_section = ""
+    if data_stats and data_stats.get("count", 0) > 0:
+        data_stats_section = f"""
+## 数据统计
+- 样本数: {data_stats['count']}
+- 平均 prompt 长度: {data_stats['avg_prompt_len']} 字符
+- 平均 answer 长度: {data_stats['avg_answer_len']} 字符
+"""
 
     # ---- 历史结果表格 ----
     history_section = ""
@@ -123,9 +229,8 @@ def build_code_prompt(
         # 上轮详细信息
         last = history[-1]
         if last.exit_code != 0 and last.stdout:
-            # 训练失败 → 给出错误日志
-            tail = "\n".join(last.stdout.strip().splitlines()[-40:])
-            history_section += f"\n### 上轮错误日志（最后 40 行）\n```\n{tail}\n```\n"
+            tail = "\n".join(last.stdout.strip().splitlines()[-60:])
+            history_section += f"\n### 上轮错误日志（最后 60 行）\n```\n{tail}\n```\n"
             history_section += "\n**请根据错误信息修复代码。**\n"
         elif last.score is not None:
             history_section += f"\n### 上轮评测\n- Score: {last.score}\n- Improvement: {last.improvement}\n"
@@ -145,20 +250,90 @@ def build_code_prompt(
                 code_text = code_text[:4000] + "\n# ... (truncated)"
             prev_code_section = f"\n## 上轮代码\n```python\n{code_text}\n```\n"
 
+    # ---- GRPO 参考代码（仅第 1 轮） ----
+    grpo_template = ""
+    if iteration == 1:
+        grpo_template = """
+## GRPO 参考代码模板（TRL 0.27+）
+
+以下是可直接运行的最小 GRPO 训练代码，**请基于此模板修改**，不要从零开始写：
+
+```python
+import os, json, re
+from datasets import Dataset
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from trl import GRPOConfig, GRPOTrainer
+
+MODEL_PATH = os.environ["MODEL_PATH"]
+DATA_PATH = os.environ["DATA_PATH"]
+OUTPUT_DIR = os.environ["OUTPUT_DIR"]
+
+# 1. 加载数据 → Dataset 格式，必须有 "prompt" 字段
+with open(os.path.join(DATA_PATH, "train.jsonl")) as f:
+    raw = [json.loads(l) for l in f if l.strip()]
+
+# 根据实际数据格式调整 prompt 构造（先 head -3 看数据格式）
+prompts = []
+for item in raw:
+    question = item.get("question") or item.get("prompt") or item.get("instruction")
+    prompts.append([{"role": "user", "content": question}])
+
+dataset = Dataset.from_dict({"prompt": prompts})
+
+# 2. Reward 函数（返回 float list，每条样本一个 reward）
+def reward_fn(completions: list[str], **kwargs) -> list[float]:
+    rewards = []
+    for text in completions:
+        # 简单示例：有数字答案 +1，否则 0；请根据任务替换
+        rewards.append(1.0 if re.search(r"\\d+", text) else 0.0)
+    return rewards
+
+# 3. 训练配置
+config = GRPOConfig(
+    output_dir=OUTPUT_DIR,
+    num_train_epochs=1,
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=2,
+    learning_rate=5e-6,
+    max_completion_length=256,
+    logging_steps=10,
+    save_strategy="epoch",
+    bf16=True,
+    report_to="none",
+)
+
+# 4. 训练
+tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained(MODEL_PATH, trust_remote_code=True)
+trainer = GRPOTrainer(model=model, args=config, tokenizer=tokenizer,
+                      train_dataset=dataset, reward_funcs=reward_fn)
+trainer.train()
+trainer.save_model(OUTPUT_DIR)
+tokenizer.save_pretrained(OUTPUT_DIR)
+print(f"Model saved to {OUTPUT_DIR}")
+```
+
+**注意事项**：
+- TRL 版本 0.27+，`reward_funcs` 参数接受函数或函数列表
+- prompt 必须是 chat 格式（list of dict），不是纯字符串
+- 可以先用少量样本快速验证链路能跑通，确认无误后再全量训练
+"""
+
     # ---- 主 prompt ----
     if iteration == 1:
         task_instruction = f"""## 你的任务（第 1 轮：链路打通）
-1. 用 terminal 探索数据格式：`head -5 {data_path}/train.jsonl` 或 `ls {data_path}/`
+1. 用 terminal 快速查看数据格式：`head -3 {data_path}/train.jsonl`
 2. 阅读 {workspace}/description.md 了解任务要求
-3. 在 {workspace}/code/ 下编写 train.py
-4. 代码要求：
+3. **基于上面的参考代码模板**，在 {workspace}/code/ 下编写 train.py
+4. 重点工作：
+   - 根据数据格式调整 prompt 构造
+   - 根据任务设计 reward 函数（参考 description.md）
    - 路径通过 os.environ 获取（MODEL_PATH, DATA_PATH, OUTPUT_DIR）
-   - 使用 trl 的 GRPOTrainer（推荐），设计合适的 reward 函数
    - 训练完成后保存模型到 $OUTPUT_DIR
-   - 合理设置参数：小 batch、少步数，先验证链路能跑通
-5. 完成后调用 finish 工具结束
+5. 建议：可以先用少量样本验证链路能跑通，后续轮再全量训练
+6. 完成后调用 finish 工具结束
 
-**重要**：你只负责写代码，不要自己执行训练脚本。pipeline 会自动运行。"""
+**重要**：你只负责写代码，不要自己执行训练脚本。pipeline 会用 accelerate 自动运行。"""
     else:
         task_instruction = f"""## 你的任务（第 {iteration} 轮：迭代优化）
 1. 分析上轮结果（见历史实验和错误日志）
@@ -167,9 +342,10 @@ def build_code_prompt(
    - 如果上轮失败：修复错误
    - 如果 score 为空：确保模型保存到 $OUTPUT_DIR
    - 如果有 score：优化 reward 函数、调整超参数、尝试不同策略
+   - 如果上轮用了数据子集：可以尝试增大数据量或训练步数
 4. 完成后调用 finish 工具结束
 
-**重要**：你只负责写代码，不要自己执行训练脚本。pipeline 会自动运行。"""
+**重要**：你只负责写代码，不要自己执行训练脚本。pipeline 会用 accelerate 自动运行。"""
 
     return f"""你是 RL 后训练专家。
 
@@ -177,7 +353,7 @@ def build_code_prompt(
 - 只能在 {workspace} 内操作
 - 禁止 pip install 或任何包管理命令
 - 预装库：transformers, trl, torch, vllm, datasets, accelerate, peft
-
+{gpu_section}
 ## 目录结构
 - 代码区: {workspace}/code/
 - 训练数据: {data_path}（只读）
@@ -188,10 +364,11 @@ def build_code_prompt(
 - MODEL_PATH={model_path}
 - DATA_PATH={data_path}
 - OUTPUT_DIR={output_dir}
-
+- CUDA_VISIBLE_DEVICES={gpu_info['cuda_devices'] if gpu_info else ''}
+{data_stats_section}
 ## 任务描述
 {task_description}
-{history_section}{prev_code_section}{task_instruction}"""
+{grpo_template}{history_section}{prev_code_section}{task_instruction}"""
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +383,8 @@ def phase_code_generation(
     task_description: str,
     history: list[IterationResult],
     max_agent_steps: int = 25,
+    data_stats: dict | None = None,
+    gpu_info: dict | None = None,
 ) -> str:
     """Phase 1: 代码生成
 
@@ -225,6 +404,7 @@ def phase_code_generation(
 
     prompt = build_code_prompt(
         iteration, workspace, base_model, task_description, history,
+        data_stats=data_stats, gpu_info=gpu_info,
     )
     conv.send_message(prompt)
     conv.run()
@@ -245,7 +425,7 @@ def phase_training(
 ) -> tuple[int, str, float]:
     """Phase 2: 训练执行（pipeline 控制，非 agent）
 
-    在 $WORKSPACE/code/ 下执行 train.py，捕获输出。
+    用 accelerate launch 执行 train.py，自动多卡 DDP。
     """
     print(f"\n{'='*60}")
     print(f"  Phase 2: Training Execution")
@@ -259,9 +439,13 @@ def phase_training(
     code_dir = Path(workspace) / "code"
     start = time.time()
 
+    # 用 accelerate launch 自动多卡（bf16 由 agent 代码内的 config 控制）
+    cmd = ["accelerate", "launch", str(code_path)]
+    print(f"  CMD: {' '.join(cmd)}")
+
     try:
         proc = subprocess.run(
-            ["python", str(code_path)],
+            cmd,
             cwd=str(code_dir),
             capture_output=True,
             text=True,
@@ -280,8 +464,7 @@ def phase_training(
     print(f"  Time: {elapsed:.1f}s")
 
     if exit_code != 0:
-        # 打印最后几行错误
-        tail = "\n".join(stdout.strip().splitlines()[-10:])
+        tail = "\n".join(stdout.strip().splitlines()[-15:])
         print(f"  Error tail:\n{tail}")
 
     return exit_code, stdout, elapsed
@@ -327,6 +510,48 @@ def phase_evaluation(
     except Exception as e:
         print(f"  Evaluation failed: {e}")
         return None
+
+
+def build_fix_prompt(
+    code_path: str,
+    error_log: str,
+    data_path: str,
+    workspace: str,
+) -> str:
+    """构造训练失败后的修复 prompt（开新 Conversation 用）。"""
+    code_text = ""
+    if Path(code_path).exists():
+        code_text = Path(code_path).read_text()
+        if len(code_text) > 6000:
+            code_text = code_text[:6000] + "\n# ... (truncated)"
+
+    data_preview = load_data_preview(data_path, num_samples=3)
+    error_tail = "\n".join(error_log.strip().splitlines()[-100:]) if error_log else "（无日志）"
+
+    return f"""训练脚本执行失败，请分析错误并修复。
+
+## 错误日志（最后 100 行）
+```
+{error_tail}
+```
+
+## 当前 train.py
+```python
+{code_text}
+```
+
+## 数据预览（前 3 条）
+```json
+{data_preview}
+```
+
+## 要求
+1. 仔细分析错误原因
+2. 修复 {workspace}/code/train.py
+3. 使用 file_editor 工具保存修复后的代码
+4. 不要执行脚本，pipeline 会自动运行
+5. 完成后调用 finish 工具结束
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +600,13 @@ def run_pipeline(
     if not task_description.strip():
         print("WARNING: No description.md or instructions.md found in workspace")
 
+    # 预计算数据统计和 GPU 信息
+    data_path = os.environ.get("DATA_PATH", "")
+    data_stats = get_data_stats(data_path)
+    gpu_info = get_gpu_info()
+    print(f"  Data: {data_stats['count']} samples")
+    print(f"  GPU: {gpu_info['num_gpus']}x {gpu_info['gpu_name']}")
+
     # 创建 LLM（所有迭代复用）
     llm = create_llm()
     print(f"  LLM initialized: {llm.model}\n")
@@ -382,6 +614,7 @@ def run_pipeline(
     history: list[IterationResult] = []
     best_score: float | None = None
     best_iteration = -1
+    max_fix_retries = 2  # 训练失败后最多重试次数
 
     for iteration in range(1, max_iterations + 1):
         iter_start = time.time()
@@ -399,6 +632,7 @@ def run_pipeline(
             code_path = phase_code_generation(
                 llm, iteration, workspace, base_model,
                 task_description, history, max_agent_steps,
+                data_stats=data_stats, gpu_info=gpu_info,
             )
             result.code_path = code_path
         except Exception as e:
@@ -409,10 +643,34 @@ def run_pipeline(
             history.append(result)
             continue
 
-        # Phase 2: Training Execution
+        # Phase 2: Training Execution（含重试）
         exit_code, stdout, train_time = phase_training(
             workspace, code_path, timeout=training_timeout,
         )
+
+        for retry in range(max_fix_retries):
+            if exit_code == 0:
+                break
+            print(f"\n  --- Fix retry {retry + 1}/{max_fix_retries} ---")
+            try:
+                fix_prompt = build_fix_prompt(code_path, stdout, data_path, workspace)
+                fix_agent = create_code_agent(create_llm())
+                fix_conv = Conversation(
+                    agent=fix_agent, workspace=workspace,
+                    max_iteration_per_run=15,
+                )
+                fix_conv.send_message(fix_prompt)
+                fix_conv.run()
+                print(f"  Agent fix attempt done, re-running training...")
+            except Exception as e:
+                print(f"  Fix agent failed: {e}")
+                break
+
+            exit_code, stdout, extra_time = phase_training(
+                workspace, code_path, timeout=training_timeout,
+            )
+            train_time += extra_time
+
         result.exit_code = exit_code
         result.stdout = stdout
         result.training_time = train_time
