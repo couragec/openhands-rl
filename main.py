@@ -305,8 +305,13 @@ config = GRPOConfig(
 # 4. 训练
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
 model = AutoModelForCausalLM.from_pretrained(MODEL_PATH, trust_remote_code=True)
-trainer = GRPOTrainer(model=model, args=config, tokenizer=tokenizer,
-                      train_dataset=dataset, reward_funcs=reward_fn)
+trainer = GRPOTrainer(
+    model=model,
+    reward_funcs=reward_fn,
+    args=config,
+    train_dataset=dataset,
+    processing_class=tokenizer,
+)
 trainer.train()
 trainer.save_model(OUTPUT_DIR)
 tokenizer.save_pretrained(OUTPUT_DIR)
@@ -314,7 +319,8 @@ print(f"Model saved to {OUTPUT_DIR}")
 ```
 
 **注意事项**：
-- TRL 版本 0.27+，`reward_funcs` 参数接受函数或函数列表
+- TRL 版本 0.28+，GRPOTrainer 签名：`GRPOTrainer(model, reward_funcs, args, train_dataset, processing_class=tokenizer)`
+- 注意是 `processing_class` 不是 `tokenizer`，`reward_funcs` 是第二个位置参数
 - prompt 必须是 chat 格式（list of dict），不是纯字符串
 - 可以先用少量样本快速验证链路能跑通，确认无误后再全量训练
 """
