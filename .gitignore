@@ -1,1 +1,20 @@
 doc/
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Run artifacts (each run creates runs/{benchmark}_{timestamp}/)
+runs/
+
+# FSM runtime outputs (not committed)
+.aider_fsm/artifacts/
+.aider_fsm/cache/
+.aider_fsm/venv*/
+.aider_fsm/runtime_env.json
+.aider_fsm/rollout.json
+.aider_fsm/metrics.json
+.aider_fsm/samples.jsonl
+.aider_fsm/hints_*.json
+.aider_fsm/actions.yml
+.aider_fsm/deploy.pid
