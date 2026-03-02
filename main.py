@@ -134,6 +134,7 @@ class IterationResult:
     best_score: float | None = None
     model_path: str = ""
     code_path: str = ""
+    analysis: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +257,13 @@ def build_code_prompt(
             history_section += "\n### 上轮训练成功但无评测结果\n"
             history_section += "可能原因：模型未保存到 $OUTPUT_DIR，或输出目录为空。\n"
             history_section += "**请确保代码中有 `trainer.save_model(OUTPUT_DIR)` 或等效保存操作。**\n"
+
+        # 上轮自分析报告（跨轮次记忆）
+        if last.analysis and last.analysis.strip():
+            analysis_text = last.analysis.strip()
+            if len(analysis_text) > 3000:
+                analysis_text = analysis_text[:3000] + "\n... (截断)"
+            history_section += f"\n### 上轮自分析报告\n{analysis_text}\n"
 
     # ---- 上轮代码 ----
     prev_code_section = ""
@@ -577,6 +585,110 @@ def build_fix_prompt(
 """
 
 
+def build_analysis_prompt(
+    iteration: int,
+    workspace: str,
+    result: "IterationResult",
+    best_score: float | None,
+    best_iteration: int,
+) -> str:
+    """构造 Analysis 阶段的 prompt，让 agent 总结本轮并规划下一步。"""
+    score_info = f"Score: {result.score}" if result.score is not None else "未获得分数"
+    if result.exit_code != 0:
+        status = f"训练失败（exit code {result.exit_code}）"
+    elif result.score is not None:
+        status = f"训练成功，{score_info}"
+    else:
+        status = "训练成功但未获得评测分数"
+
+    best_info = f"历史最佳: {best_score}（第 {best_iteration} 轮）" if best_score is not None else "暂无历史分数"
+
+    code_text = ""
+    code_file = Path(result.code_path)
+    if code_file.exists():
+        code_text = code_file.read_text()
+        if len(code_text) > 4000:
+            code_text = code_text[:4000] + "\n# ... (truncated)"
+
+    error_section = ""
+    if result.exit_code != 0 and result.stdout:
+        tail = "\n".join(result.stdout.strip().splitlines()[-40:])
+        error_section = f"\n## 错误日志（最后 40 行）\n```\n{tail}\n```\n"
+
+    return f"""你是 RL 训练专家。请分析第 {iteration} 轮实验的结果，写一份简短的诊断报告。
+
+## 本轮状态
+- {status}
+- 训练耗时: {result.training_time:.0f}s
+- {best_info}
+
+## 本轮代码
+```python
+{code_text}
+```
+{error_section}
+## 请写一份简短分析（200-400字），包含：
+1. **做了什么**：本轮训练方法、关键配置
+2. **结果分析**：为什么成功/失败/分数高低
+3. **下一步计划**：具体要改什么、尝试什么策略
+
+直接输出分析文本，不需要写代码。完成后调用 finish 工具结束。
+"""
+
+
+def phase_analysis(
+    llm: LLM,
+    iteration: int,
+    workspace: str,
+    result: "IterationResult",
+    best_score: float | None,
+    best_iteration: int,
+) -> str:
+    """Phase 4: Analysis — 让 agent 总结本轮并规划下一步。
+
+    返回 analysis 文本。
+    """
+    print(f"\n{'='*60}")
+    print(f"  Phase 4: Analysis (iteration {iteration})")
+    print(f"{'='*60}")
+
+    agent = create_code_agent(llm)
+    conv = Conversation(
+        agent=agent,
+        workspace=workspace,
+        max_iteration_per_run=10,
+    )
+
+    prompt = build_analysis_prompt(
+        iteration, workspace, result, best_score, best_iteration,
+    )
+    conv.send_message(prompt)
+    conv.run()
+
+    analysis_file = Path(workspace) / "analysis.md"
+    if analysis_file.exists():
+        analysis_text = analysis_file.read_text().strip()
+        if analysis_text:
+            print(f"  Analysis saved: {len(analysis_text)} chars")
+            return analysis_text
+
+    last_msg = ""
+    if hasattr(conv, "messages") and conv.messages:
+        for msg in reversed(conv.messages):
+            content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
+            if content and len(content) > 50:
+                last_msg = content
+                break
+
+    if last_msg:
+        analysis_file.write_text(last_msg)
+        print(f"  Analysis extracted from conversation: {len(last_msg)} chars")
+        return last_msg
+
+    print("  WARNING: No analysis produced")
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Main Pipeline
 # ---------------------------------------------------------------------------
@@ -595,7 +707,8 @@ def run_pipeline(
       Phase 1: Agent 写代码（探索数据 + 编写 train.py）
       Phase 2: Pipeline 执行训练（subprocess）
       Phase 3: Pipeline 提交评测（HTTP POST）
-      Phase 4: 记录结果，注入到下轮 prompt
+      Phase 4: Agent 自分析（总结本轮 + 规划下一步，作为跨轮记忆）
+      Phase 5: 记录结果，注入到下轮 prompt
     """
     pipeline_start = time.time()
     grading_url = os.environ.get("GRADING_SERVER_URL", "http://localhost:5000")
@@ -638,7 +751,7 @@ def run_pipeline(
     history: list[IterationResult] = []
     best_score: float | None = None
     best_iteration = -1
-    max_fix_retries = 2  # 训练失败后最多重试次数
+    max_fix_retries = 3  # 训练失败后最多重试次数
 
     for iteration in range(1, max_iterations + 1):
         iter_start = time.time()
@@ -712,7 +825,16 @@ def run_pipeline(
                     best_score = result.score
                     best_iteration = iteration
 
-        # Phase 4: Record
+        # Phase 4: Analysis（让 agent 总结本轮，生成跨轮记忆）
+        try:
+            analysis_text = phase_analysis(
+                llm, iteration, workspace, result, best_score, best_iteration,
+            )
+            result.analysis = analysis_text
+        except Exception as e:
+            print(f"  Analysis failed (non-fatal): {e}")
+
+        # Phase 5: Record
         history.append(result)
 
         iter_elapsed = time.time() - iter_start
@@ -746,6 +868,7 @@ def run_pipeline(
                 "training_time": r.training_time,
                 "score": r.score,
                 "improvement": r.improvement,
+                "analysis": r.analysis[:500] if r.analysis else "",
             }
             for r in history
         ],
