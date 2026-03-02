@@ -32,61 +32,69 @@ from openhands.tools.terminal import TerminalTool
 # ---------------------------------------------------------------------------
 
 def get_data_stats(data_path: str) -> dict:
-    """读取 train.jsonl，返回样本数和长度统计。"""
-    samples = []
+    """获取数据目录信息。优先尝试解析 train.jsonl，否则列出目录文件。"""
     path = Path(data_path)
+    if not path.exists():
+        return {"count": 0, "files": [], "type": "missing"}
+
     jsonl = path / "train.jsonl" if path.is_dir() else path
+    if jsonl.exists() and jsonl.suffix == ".jsonl":
+        samples = []
+        try:
+            with open(jsonl, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        samples.append(json.loads(line))
+        except Exception:
+            pass
+        if samples:
+            prompt_lens, answer_lens = [], []
+            for s in samples:
+                prompt = s.get("prompt") or s.get("question") or s.get("instruction") or ""
+                answer = s.get("answer") or s.get("response") or s.get("output") or ""
+                prompt_lens.append(len(prompt))
+                answer_lens.append(len(answer))
+            return {
+                "count": len(samples),
+                "avg_prompt_len": sum(prompt_lens) // max(len(prompt_lens), 1),
+                "avg_answer_len": sum(answer_lens) // max(len(answer_lens), 1),
+                "type": "jsonl",
+                "files": [jsonl.name],
+            }
 
-    if not jsonl.exists():
-        return {"count": 0, "avg_prompt_len": 0, "avg_answer_len": 0}
+    if path.is_dir():
+        files = sorted(f.name for f in path.iterdir() if not f.name.startswith("."))
+        return {"count": 0, "files": files, "type": "directory"}
 
-    try:
-        with open(jsonl, "r", encoding="utf-8") as f:
-            for line in f:
-                if line.strip():
-                    samples.append(json.loads(line))
-    except Exception:
-        return {"count": 0, "avg_prompt_len": 0, "avg_answer_len": 0}
-
-    if not samples:
-        return {"count": 0, "avg_prompt_len": 0, "avg_answer_len": 0}
-
-    prompt_lens = []
-    answer_lens = []
-    for s in samples:
-        # 支持多种格式
-        prompt = s.get("prompt") or s.get("question") or s.get("instruction") or ""
-        answer = s.get("answer") or s.get("response") or s.get("output") or ""
-        prompt_lens.append(len(prompt))
-        answer_lens.append(len(answer))
-
-    return {
-        "count": len(samples),
-        "avg_prompt_len": sum(prompt_lens) // max(len(prompt_lens), 1),
-        "avg_answer_len": sum(answer_lens) // max(len(answer_lens), 1),
-    }
+    return {"count": 0, "files": [path.name], "type": "file"}
 
 
 def load_data_preview(data_path: str, num_samples: int = 3) -> str:
-    """返回 train.jsonl 前几条样本的 JSON 预览。"""
+    """返回数据预览。支持 jsonl 文件和普通目录。"""
     path = Path(data_path)
+
+    if not path.exists():
+        return "（数据路径不存在）"
+
     jsonl = path / "train.jsonl" if path.is_dir() else path
+    if jsonl.exists() and jsonl.suffix == ".jsonl":
+        records = []
+        try:
+            with open(jsonl, "r", encoding="utf-8") as f:
+                for i, line in enumerate(f):
+                    if i >= num_samples:
+                        break
+                    if line.strip():
+                        records.append(json.loads(line))
+        except Exception as e:
+            return f"（读取失败: {e}）"
+        return json.dumps(records, ensure_ascii=False, indent=2)
 
-    if not jsonl.exists():
-        return "（数据文件不存在）"
+    if path.is_dir():
+        files = sorted(f.name for f in path.iterdir() if not f.name.startswith("."))
+        return f"数据目录包含文件: {', '.join(files[:20])}"
 
-    records = []
-    try:
-        with open(jsonl, "r", encoding="utf-8") as f:
-            for i, line in enumerate(f):
-                if i >= num_samples:
-                    break
-                if line.strip():
-                    records.append(json.loads(line))
-    except Exception as e:
-        return f"（读取失败: {e}）"
-
-    return json.dumps(records, ensure_ascii=False, indent=2)
+    return "（无法预览）"
 
 
 def get_gpu_info() -> dict:
@@ -203,12 +211,21 @@ def build_code_prompt(
 
     # ---- 数据统计 ----
     data_stats_section = ""
-    if data_stats and data_stats.get("count", 0) > 0:
-        data_stats_section = f"""
+    if data_stats:
+        ds_type = data_stats.get("type", "")
+        if ds_type == "jsonl" and data_stats.get("count", 0) > 0:
+            data_stats_section = f"""
 ## 数据统计
 - 样本数: {data_stats['count']}
 - 平均 prompt 长度: {data_stats['avg_prompt_len']} 字符
 - 平均 answer 长度: {data_stats['avg_answer_len']} 字符
+"""
+        elif ds_type == "directory" and data_stats.get("files"):
+            files_list = ", ".join(data_stats["files"][:15])
+            data_stats_section = f"""
+## 数据目录
+- 文件: {files_list}
+- 提示: 用 ls/cat 探索具体文件内容
 """
 
     # ---- 历史结果表格 ----
@@ -250,13 +267,11 @@ def build_code_prompt(
                 code_text = code_text[:4000] + "\n# ... (truncated)"
             prev_code_section = f"\n## 上轮代码\n```python\n{code_text}\n```\n"
 
-    # ---- GRPO 参考代码（仅第 1 轮） ----
-    grpo_template = ""
-    if iteration == 1:
-        grpo_template = """
-## GRPO 参考代码模板（TRL 0.28+）
+    # ---- GRPO 参考模板（仅第 1 轮附带） ----
+    grpo_reference = """
+## GRPO 参考代码（TRL 0.27+，适用于静态数据集类任务）
 
-以下是一个可参考的 GRPO 训练代码示例，可以根据需要自行调整：
+如果任务有 train.jsonl 等静态数据，可参考以下模板快速上手：
 
 ```python
 import os, json, re
@@ -272,16 +287,14 @@ OUTPUT_DIR = os.environ["OUTPUT_DIR"]
 with open(os.path.join(DATA_PATH, "train.jsonl")) as f:
     raw = [json.loads(l) for l in f if l.strip()]
 
-# 根据实际数据格式调整 prompt 构造（先 head -3 看数据格式）
 prompts = []
 for item in raw:
     question = item.get("question") or item.get("prompt") or item.get("instruction")
-    prompts.append([{"role": "user", "content": question}])
+    prompts.append([{{"role": "user", "content": question}}])
 
-dataset = Dataset.from_dict({"prompt": prompts})
+dataset = Dataset.from_dict({{"prompt": prompts}})
 
-# 2. Reward 函数
-# 注意：completions 可能是 chat 格式（list of dicts）或纯字符串，必须先提取文本
+# 2. Reward 函数（根据任务替换）
 def reward_fn(completions, **kwargs) -> list[float]:
     rewards = []
     for comp in completions:
@@ -289,11 +302,10 @@ def reward_fn(completions, **kwargs) -> list[float]:
             text = comp[-1]["content"] if comp else ""
         else:
             text = str(comp)
-        # 简单示例：有数字答案 +1，否则 0；请根据任务替换
-        rewards.append(1.0 if re.search(r"\\d+", text) else 0.0)
+        rewards.append(1.0 if re.search(r"\\\\d+", text) else 0.0)
     return rewards
 
-# 3. 训练配置
+# 3. 训练
 config = GRPOConfig(
     output_dir=OUTPUT_DIR,
     num_train_epochs=1,
@@ -307,8 +319,6 @@ config = GRPOConfig(
     bf16=True,
     report_to="none",
 )
-
-# 4. 训练
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
 model = AutoModelForCausalLM.from_pretrained(MODEL_PATH, trust_remote_code=True)
 trainer = GRPOTrainer(
@@ -321,34 +331,33 @@ trainer = GRPOTrainer(
 trainer.train()
 trainer.save_model(OUTPUT_DIR)
 tokenizer.save_pretrained(OUTPUT_DIR)
-print(f"Model saved to {OUTPUT_DIR}")
 ```
 
-**注意事项**：
-- TRL 版本 0.28+，GRPOTrainer 签名：`GRPOTrainer(model, reward_funcs, args, train_dataset, processing_class=tokenizer)`
-- 注意是 `processing_class` 不是 `tokenizer`（旧版用 tokenizer 会报错）
-- `reward_funcs` 是第二个位置参数
-- completions 是 chat 格式（list of dicts），reward 函数里要用 `comp[-1]["content"]` 提取文本
-- prompt 必须是 chat 格式（list of dict），不是纯字符串
+**GRPO 注意事项**：
+- `GRPOTrainer(model, reward_funcs, args, train_dataset, processing_class=tokenizer)` — 注意是 `processing_class` 不是 `tokenizer`
+- prompt 必须是 chat 格式（list of dict），completions 也是 chat 格式
 - `num_generations` 必须能被 `per_device_train_batch_size * num_gpus` 整除
-- 可以先用少量样本快速验证链路能跑通，确认无误后再全量训练
+
+**交互式环境类任务**（如 ALFWorld）不适合直接套用此模板，需要参考 eval.py 中的环境交互逻辑设计 rollout + reward 流程。
 """
 
     # ---- 主 prompt ----
     if iteration == 1:
-        task_instruction = f"""## 你的任务（第 1 轮：链路打通）
-1. 用 terminal 快速查看数据格式：`head -3 {data_path}/train.jsonl`
-2. 阅读 {workspace}/description.md 了解任务要求
-3. 在 {workspace}/code/ 下编写 train.py（可参考上面的代码示例）
-4. 重点工作：
-   - 根据数据格式调整 prompt 构造
-   - 根据任务设计 reward 函数（参考 description.md）
-   - 路径通过 os.environ 获取（MODEL_PATH, DATA_PATH, OUTPUT_DIR）
-   - 训练完成后保存模型到 $OUTPUT_DIR
-5. 建议：可以先用少量样本验证链路能跑通，后续轮再全量训练
-6. 完成后调用 finish 工具结束
+        task_instruction = f"""## 你的任务（第 1 轮：理解任务 + 编写训练代码）
 
-**重要**：你只负责写代码，不要自己执行训练脚本。pipeline 会用 accelerate 自动运行。"""
+1. **探索工作区**：`ls {workspace}` 查看所有可用文件
+2. **阅读任务描述**：`cat {workspace}/description.md`
+3. **阅读评测代码**（如果有 eval.py）：`cat {workspace}/eval.py` — 包含环境交互、模型推理、reward 计算的完整逻辑，对理解任务至关重要
+4. **探索数据**：`ls {data_path}` 查看数据格式，用 head/cat 查看内容
+5. **编写 train.py**：在 {workspace}/code/ 下编写训练脚本
+   - 路径通过环境变量获取：MODEL_PATH, DATA_PATH, OUTPUT_DIR
+   - 训练方式不限：SFT、GRPO、PPO、自定义 RL 均可
+   - 训练完成后保存模型到 $OUTPUT_DIR
+6. 建议：先用少量数据验证能跑通，后续轮再全量训练
+7. 完成后调用 finish 工具结束
+
+**重要**：你只负责写代码，不要自己执行训练脚本。pipeline 会自动运行。
+{grpo_reference}"""
     else:
         task_instruction = f"""## 你的任务（第 {iteration} 轮：迭代优化）
 1. 分析上轮结果（见历史实验和错误日志）
@@ -356,18 +365,16 @@ print(f"Model saved to {OUTPUT_DIR}")
 3. 改进方向：
    - 如果上轮失败：修复错误
    - 如果 score 为空：确保模型保存到 $OUTPUT_DIR
-   - 如果有 score：优化 reward 函数、调整超参数、尝试不同策略
-   - 如果上轮用了数据子集：可以尝试增大数据量或训练步数
+   - 如果有 score：尝试不同训练策略、调整超参数、增加数据量
+   - 如果只做了 SFT：考虑能否用 RL（参考 eval.py 中的环境交互逻辑获取 reward）
 4. 完成后调用 finish 工具结束
 
-**重要**：你只负责写代码，不要自己执行训练脚本。pipeline 会用 accelerate 自动运行。"""
+**重要**：你只负责写代码，不要自己执行训练脚本。pipeline 会自动运行。"""
 
     return f"""你是 RL 后训练专家。
 
 ## 安全限制
 - 只能在 {workspace} 内操作
-- 禁止 pip install 或任何包管理命令
-- 预装库：transformers, trl, torch, vllm, datasets, accelerate, peft
 {gpu_section}
 ## 目录结构
 - 代码区: {workspace}/code/
@@ -383,7 +390,7 @@ print(f"Model saved to {OUTPUT_DIR}")
 {data_stats_section}
 ## 任务描述
 {task_description}
-{grpo_template}{history_section}{prev_code_section}{task_instruction}"""
+{history_section}{prev_code_section}{task_instruction}"""
 
 
 # ---------------------------------------------------------------------------
@@ -454,8 +461,9 @@ def phase_training(
     code_dir = Path(workspace) / "code"
     start = time.time()
 
-    # 用 accelerate launch 自动多卡（bf16 由 agent 代码内的 config 控制）
-    cmd = ["accelerate", "launch", str(code_path)]
+    # 用训练环境的 Python 执行（TRAINING_PYTHON 由 start.sh 设置，指向 cwy-rl 环境）
+    training_python = os.environ.get("TRAINING_PYTHON", "python")
+    cmd = [training_python, "-m", "accelerate.commands.launch", str(code_path)]
     print(f"  CMD: {' '.join(cmd)}")
 
     try:
@@ -619,7 +627,8 @@ def run_pipeline(
     data_path = os.environ.get("DATA_PATH", "")
     data_stats = get_data_stats(data_path)
     gpu_info = get_gpu_info()
-    print(f"  Data: {data_stats['count']} samples")
+    ds_info = f"{data_stats['count']} samples" if data_stats.get("count") else f"{len(data_stats.get('files', []))} files ({data_stats.get('type', '')})"
+    print(f"  Data: {ds_info}")
     print(f"  GPU: {gpu_info['num_gpus']}x {gpu_info['gpu_name']}")
 
     # 创建 LLM（所有迭代复用）
