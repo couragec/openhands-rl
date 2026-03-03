@@ -359,7 +359,7 @@ tokenizer.save_pretrained(OUTPUT_DIR)
 4. **探索数据**：`ls {data_path}` 查看数据格式，用 head/cat 查看内容
 5. **编写 train.py**：在 {workspace}/code/ 下编写训练脚本
    - 路径通过环境变量获取：MODEL_PATH, DATA_PATH, OUTPUT_DIR
-   - 训练方式：必须使用 RL（如 GRPO、PPO 等），禁止使用 SFT。本项目目标是 RL post-training
+   - 训练方式：推荐 RL（如 GRPO、PPO），SFT 可作为初始 baseline，但最终目标是 RL post-training
    - 训练完成后保存模型到 $OUTPUT_DIR
 6. 建议：先用少量数据验证能跑通，后续轮再全量训练
 7. 完成后调用 finish 工具结束
@@ -373,7 +373,7 @@ tokenizer.save_pretrained(OUTPUT_DIR)
 3. 改进方向：
    - 如果上轮失败：修复错误
    - 如果 score 为空：确保模型保存到 $OUTPUT_DIR
-   - 如果有 score：尝试不同 RL 策略（reward 函数、超参数、rollout 设计等）提升分数
+   - 如果有 score：尝试不同训练策略（reward 函数、超参数、rollout 设计等）提升分数,最终目标是 RL post-training
 4. 完成后调用 finish 工具结束
 
 **重要**：你只负责写代码，不要自己执行训练脚本。pipeline 会自动运行。"""
