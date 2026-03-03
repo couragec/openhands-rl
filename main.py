@@ -277,9 +277,9 @@ def build_code_prompt(
 
     # ---- GRPO 参考模板（仅第 1 轮附带） ----
     grpo_reference = """
-## GRPO 参考代码（TRL 0.27+，适用于静态数据集类任务）
+## GRPO 参考代码（TRL 0.27+）
 
-如果任务有 train.jsonl 等静态数据，可参考以下模板快速上手：
+以下是 GRPO RL 训练的参考模板，根据任务实际情况调整 reward 函数和数据加载逻辑：
 
 ```python
 import os, json, re
@@ -346,7 +346,7 @@ tokenizer.save_pretrained(OUTPUT_DIR)
 - prompt 必须是 chat 格式（list of dict），completions 也是 chat 格式
 - `num_generations` 必须能被 `per_device_train_batch_size * num_gpus` 整除
 
-**交互式环境类任务**（如 ALFWorld）不适合直接套用此模板，需要参考 eval.py 中的环境交互逻辑设计 rollout + reward 流程。
+**注意**：此模板适用于有静态数据集的任务。交互式环境任务（如 ALFWorld）需参考 eval.py 设计 rollout + reward 流程，但训练框架（GRPO/PPO）思路相同。
 """
 
     # ---- 主 prompt ----
@@ -359,7 +359,7 @@ tokenizer.save_pretrained(OUTPUT_DIR)
 4. **探索数据**：`ls {data_path}` 查看数据格式，用 head/cat 查看内容
 5. **编写 train.py**：在 {workspace}/code/ 下编写训练脚本
    - 路径通过环境变量获取：MODEL_PATH, DATA_PATH, OUTPUT_DIR
-   - 训练方式不限：SFT、GRPO、PPO、自定义 RL 均可
+   - 训练方式：必须使用 RL（如 GRPO、PPO 等），禁止使用 SFT。本项目目标是 RL post-training
    - 训练完成后保存模型到 $OUTPUT_DIR
 6. 建议：先用少量数据验证能跑通，后续轮再全量训练
 7. 完成后调用 finish 工具结束
@@ -373,8 +373,7 @@ tokenizer.save_pretrained(OUTPUT_DIR)
 3. 改进方向：
    - 如果上轮失败：修复错误
    - 如果 score 为空：确保模型保存到 $OUTPUT_DIR
-   - 如果有 score：尝试不同训练策略、调整超参数、增加数据量
-   - 如果只做了 SFT：考虑能否用 RL（参考 eval.py 中的环境交互逻辑获取 reward）
+   - 如果有 score：尝试不同 RL 策略（reward 函数、超参数、rollout 设计等）提升分数
 4. 完成后调用 finish 工具结束
 
 **重要**：你只负责写代码，不要自己执行训练脚本。pipeline 会自动运行。"""
