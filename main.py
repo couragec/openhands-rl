@@ -353,13 +353,13 @@ tokenizer.save_pretrained(OUTPUT_DIR)
     if iteration == 1:
         task_instruction = f"""## 你的任务（第 1 轮：理解任务 + 编写训练代码）
 
-1. **探索工作区**：`ls {workspace}` 查看所有可用文件
-2. **阅读任务描述**：`cat {workspace}/description.md`
-3. **阅读评测代码**（如果有 eval.py）：`cat {workspace}/eval.py` — 包含环境交互、模型推理、reward 计算的完整逻辑，对理解任务至关重要
-4. **探索数据**：`ls {data_path}` 查看数据格式，用 head/cat 查看内容
-5. **编写 train.py**：在 {workspace}/code/ 下编写训练脚本
+1. **探索工作区**：`ls` 查看当前目录所有可用文件
+2. **阅读任务描述**：`cat description.md`
+3. **阅读评测代码**（如果有 eval.py）：`cat eval.py` — 包含环境交互、模型推理、reward 计算的完整逻辑，对理解任务至关重要
+4. **探索数据**：`ls data/` 查看数据格式，用 head/cat 查看内容
+5. **编写 train.py**：在 `code/` 下编写训练脚本
    - 路径通过环境变量获取：MODEL_PATH, DATA_PATH, OUTPUT_DIR
-   - 训练方式：推荐 RL（如 GRPO、PPO），SFT 可作为初始 baseline，但最终目标是 RL post-training
+   - 训练方式：SFT、GRPO、PPO 等均可，最终目标是 RL post-training
    - 训练完成后保存模型到 $OUTPUT_DIR
 6. 建议：先用少量数据验证能跑通，后续轮再全量训练
 7. 完成后调用 finish 工具结束
@@ -369,7 +369,7 @@ tokenizer.save_pretrained(OUTPUT_DIR)
     else:
         task_instruction = f"""## 你的任务（第 {iteration} 轮：迭代优化）
 1. 分析上轮结果（见历史实验和错误日志）
-2. 修改 {workspace}/code/train.py
+2. 修改 `code/train.py`
 3. 改进方向：
    - 如果上轮失败：修复错误
    - 如果 score 为空：确保模型保存到 $OUTPUT_DIR
@@ -380,19 +380,22 @@ tokenizer.save_pretrained(OUTPUT_DIR)
 
     return f"""你是 RL 后训练专家。
 
-## 安全限制
-- 只能在 {workspace} 内操作
+## 工作区规则
+- 当前目录就是你的工作区，所有需要的文件都在这里
+- **禁止 `cd` 到当前目录之外**（不要访问父目录或其他路径）
+- **只使用相对路径**（如 `./code/train.py`、`./data/`）
+- 如果看到 symlink 指向外部路径，忽略它——直接用相对路径访问
 {gpu_section}
 ## 目录结构
-- 代码区: {workspace}/code/
-- 训练数据: {data_path}（只读）
-- 基础模型: {model_path}（只读，{base_model}）
-- 模型输出: {output_dir}
+- 代码区: `./code/`
+- 训练数据: `./data/`（只读）
+- 基础模型: `./models/{base_model}`（只读）
+- 模型输出: `./output/`
 
-## 环境变量（代码中用 os.environ 读取）
-- MODEL_PATH={model_path}
-- DATA_PATH={data_path}
-- OUTPUT_DIR={output_dir}
+## 环境变量（训练脚本中用 os.environ 读取，pipeline 自动设置）
+- MODEL_PATH — 基础模型路径（等价于 `./models/{base_model}`）
+- DATA_PATH — 训练数据路径（等价于 `./data/`）
+- OUTPUT_DIR — 模型输出路径（等价于 `./output/`）
 - CUDA_VISIBLE_DEVICES={gpu_info['cuda_devices'] if gpu_info else ''}
 {data_stats_section}
 ## 任务描述
@@ -577,7 +580,7 @@ def build_fix_prompt(
 
 ## 要求
 1. 仔细分析错误原因
-2. 修复 {workspace}/code/train.py
+2. 修复 `code/train.py`
 3. 使用 file_editor 工具保存修复后的代码
 4. 不要执行脚本，pipeline 会自动运行
 5. 完成后调用 finish 工具结束
