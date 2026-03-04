@@ -138,6 +138,37 @@ class IterationResult:
 
 
 # ---------------------------------------------------------------------------
+# Conversation retry (Plan C: conversation-level retry for transient API errors)
+# ---------------------------------------------------------------------------
+
+def run_with_retry(conv: "Conversation", max_retries: int = 20, base_wait: int = 5) -> None:
+    """Wrap conv.run() with retry on transient API errors including 403.
+
+    OpenHands SDK only retries timeout/429/5xx internally.
+    This adds conversation-level retry for 403 and other transient errors
+    so the conversation resumes from where it left off.
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            conv.run()
+            return
+        except Exception as e:
+            error_msg = str(e).lower()
+            retryable_keywords = [
+                "403", "forbidden", "timeout", "504", "503", "429",
+                "rate limit", "service unavailable", "connection",
+                "internal server error", "500", "502",
+            ]
+            if any(kw in error_msg for kw in retryable_keywords) and attempt < max_retries:
+                wait = min(base_wait * (attempt + 1), 60)
+                print(f"  [Retry {attempt + 1}/{max_retries}] {type(e).__name__}: {str(e)[:200]}")
+                print(f"  Retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                raise
+
+
+# ---------------------------------------------------------------------------
 # LLM & Agent
 # ---------------------------------------------------------------------------
 
@@ -439,7 +470,7 @@ def phase_code_generation(
         data_stats=data_stats, gpu_info=gpu_info,
     )
     conv.send_message(prompt)
-    conv.run()
+    run_with_retry(conv)
 
     code_path = Path(workspace) / "code" / "train.py"
     if code_path.exists():
@@ -665,7 +696,7 @@ def phase_analysis(
         iteration, workspace, result, best_score, best_iteration,
     )
     conv.send_message(prompt)
-    conv.run()
+    run_with_retry(conv)
 
     analysis_file = Path(workspace) / "analysis.md"
     if analysis_file.exists():
@@ -799,7 +830,7 @@ def run_pipeline(
                     max_iteration_per_run=15,
                 )
                 fix_conv.send_message(fix_prompt)
-                fix_conv.run()
+                run_with_retry(fix_conv)
                 print(f"  Agent fix attempt done, re-running training...")
             except Exception as e:
                 print(f"  Fix agent failed: {e}")
