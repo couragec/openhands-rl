@@ -141,7 +141,7 @@ class IterationResult:
 # Conversation retry (Plan C: conversation-level retry for transient API errors)
 # ---------------------------------------------------------------------------
 
-def run_with_retry(conv: "Conversation", max_retries: int = 20, base_wait: int = 5) -> None:
+def run_with_retry(conv: "Conversation", max_retries: int = 200, base_wait: int = 5) -> None:
     """Wrap conv.run() with retry on transient API errors including 403.
 
     OpenHands SDK only retries timeout/429/5xx internally.
