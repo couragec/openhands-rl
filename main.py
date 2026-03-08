@@ -22,9 +22,49 @@ from pathlib import Path
 import requests
 from pydantic import SecretStr
 
-from openhands.sdk import LLM, Agent, Conversation, Tool
+from openhands.sdk import LLM, Agent, AgentContext, Conversation, Tool
+from openhands.sdk.context.skills import Skill
 from openhands.tools.file_editor import FileEditorTool
 from openhands.tools.terminal import TerminalTool
+
+
+# ---------------------------------------------------------------------------
+# Skill 1: 累积运行总结（通过 OpenHands Skill API 注入 agent）
+# ---------------------------------------------------------------------------
+
+SUMMARY_SKILL = Skill(
+    name="cumulative-summary",
+    content="""\
+你负责维护实验的累积运行总结文件 summary.md。
+
+每轮实验结束后，你需要用 file_editor 在 summary.md **末尾追加**一个新 section。
+
+如果 summary.md 不存在，先创建文件，首行写 `# 运行总结`。
+
+每轮追加的 section 格式（严格遵守）：
+
+```
+## Iteration N (YYYY-MM-DD HH:MM, 耗时 Xs)
+- **状态**: ✅ 成功 / ❌ 失败 (exit_code=X)
+- **Score**: X | Improvement: X | Best: X (iter N)
+- **训练类型**: GRPO / SFT / PPO / copy_model / placeholder / unknown
+- **关键配置**: lr=X, epochs=X, batch=X, ...（从代码中提取）
+- **做了什么**: 具体策略（训练方法、reward 函数设计、数据处理等）
+- **为什么**: 为什么选择这个策略（基于上轮结果的推理）
+- **问题/进步**: 发现了什么问题，或相比上轮取得了什么进步
+- **关键代码**: 最能体现本轮策略的 3-5 行代码
+- **下一步建议**: 基于本轮经验，下轮应该尝试什么
+```
+
+规则：
+1. **追加**，不要覆盖已有内容
+2. 分析 train.py 源码，提取训练类型和超参数
+3. 如果训练失败，从错误日志中提取根因
+4. "做了什么"和"为什么"是最重要的字段，必须深入分析
+5. 完成后调用 finish 工具结束
+""",
+    trigger=None,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -194,16 +234,30 @@ def create_llm() -> LLM:
 
 
 def create_code_agent(llm: LLM) -> Agent:
-    """创建代码生成 Agent
-
-    工具：FileEditor（写代码）+ Terminal（探索数据，不执行训练）
-    """
+    """创建代码生成 Agent（Phase 1 用）"""
     return Agent(
         llm=llm,
         tools=[
             Tool(name=FileEditorTool.name),
             Tool(name=TerminalTool.name, params={"no_change_timeout_seconds": 120}),
         ],
+    )
+
+
+def create_summary_agent(llm: LLM) -> Agent:
+    """创建总结 Agent（Phase 4.5 用）
+
+    通过 AgentContext 注入 SUMMARY_SKILL，让 agent 知道如何写 summary.md。
+    这是 OpenHands SDK Skill API 的标准用法：
+    Skill(trigger=None) → 内容注入 system prompt → agent 按指令行动。
+    """
+    return Agent(
+        llm=llm,
+        tools=[
+            Tool(name=FileEditorTool.name),
+            Tool(name=TerminalTool.name, params={"no_change_timeout_seconds": 30}),
+        ],
+        agent_context=AgentContext(skills=[SUMMARY_SKILL]),
     )
 
 
@@ -765,6 +819,133 @@ def phase_summary(
     print(f"  Summary appended: {summary_path} (iteration {iteration})")
 
 
+def _build_summary_message(
+    iteration: int,
+    workspace: str,
+    result: "IterationResult",
+    best_score: float | None,
+    best_iteration: int,
+    history: list["IterationResult"],
+    task: str = "",
+    base_model: str = "",
+) -> str:
+    """构造发给 summary agent 的 user message（提供本轮数据）。"""
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    if result.exit_code == 0:
+        status = "✅ 成功"
+    elif result.exit_code == -1:
+        status = "❌ 代码生成失败"
+    else:
+        status = f"❌ 训练失败 (exit_code={result.exit_code})"
+
+    score_str = f"{result.score:.2f}" if result.score is not None else "—"
+    imp_str = f"{result.improvement:+.2f}" if result.improvement is not None else "—"
+    best_str = f"{best_score:.2f} (iter {best_iteration})" if best_score is not None else "—"
+
+    code_text = ""
+    code_file = Path(result.code_path) if result.code_path else Path(workspace) / "code" / "train.py"
+    if code_file.exists():
+        code_text = code_file.read_text(errors="replace")
+        if len(code_text) > 5000:
+            code_text = code_text[:5000] + "\n# ... (truncated)"
+
+    error_section = ""
+    if result.exit_code != 0 and result.stdout:
+        tail = "\n".join(result.stdout.strip().splitlines()[-30:])
+        error_section = f"\n## 错误日志（最后 30 行）\n```\n{tail}\n```\n"
+
+    history_table = ""
+    if len(history) > 1:
+        rows = []
+        for h in history[:-1]:
+            s = f"{h.score:.2f}" if h.score is not None else "-"
+            imp = f"{h.improvement:+.2f}" if h.improvement is not None else "-"
+            st = "OK" if h.exit_code == 0 else "FAIL"
+            rows.append(f"| {h.iteration} | {st} | {s} | {imp} |")
+        history_table = (
+            "\n## 前几轮历史\n"
+            "| 轮次 | 状态 | Score | Improvement |\n"
+            "|------|------|-------|-------------|\n"
+            + "\n".join(rows) + "\n"
+        )
+
+    analysis_section = ""
+    if result.analysis:
+        analysis_section = f"\n## Agent 自分析\n{result.analysis[:500]}\n"
+
+    return f"""请在 summary.md 中追加第 {iteration} 轮的总结。
+
+## 基本信息
+- Task: {task} | Model: {base_model}
+- 时间: {ts}
+- 状态: {status}
+- Score: {score_str} | Improvement: {imp_str} | Best: {best_str}
+- 训练耗时: {result.training_time:.0f}s
+
+## train.py 代码
+```python
+{code_text}
+```
+{error_section}{history_table}{analysis_section}
+请根据你的 Skill 指令，分析上述信息，然后用 file_editor 追加到 summary.md。"""
+
+
+def phase_summary_v2(
+    llm: LLM,
+    iteration: int,
+    workspace: str,
+    result: "IterationResult",
+    best_score: float | None,
+    best_iteration: int,
+    history: list["IterationResult"],
+    task: str = "",
+    base_model: str = "",
+) -> None:
+    """Phase 4.5 v2: 用 OpenHands Skill API 驱动的累积总结。
+
+    通过 SUMMARY_SKILL 注入 AgentContext → agent 按 Skill 指令写 summary.md。
+    失败时 fallback 到纯 Python 的 phase_summary。
+    """
+    print(f"\n{'='*60}")
+    print(f"  Phase 4.5: Summary via Skill (iteration {iteration})")
+    print(f"{'='*60}")
+
+    try:
+        agent = create_summary_agent(llm)
+        conv = Conversation(
+            agent=agent,
+            workspace=workspace,
+            max_iteration_per_run=10,
+        )
+
+        msg = _build_summary_message(
+            iteration, workspace, result,
+            best_score, best_iteration, history,
+            task=task, base_model=base_model,
+        )
+        conv.send_message(msg)
+        run_with_retry(conv)
+
+        summary_path = Path(workspace) / "summary.md"
+        if summary_path.exists():
+            size = summary_path.stat().st_size
+            print(f"  summary.md updated: {size} bytes")
+        else:
+            print("  WARNING: agent did not create summary.md, falling back")
+            raise RuntimeError("summary.md not created")
+
+    except Exception as e:
+        print(f"  Skill-based summary failed: {e}")
+        print("  Falling back to pure-Python phase_summary...")
+        phase_summary(
+            iteration, workspace, result,
+            best_score, best_iteration,
+            task=task, base_model=base_model,
+        )
+
+
 def phase_analysis(
     llm: LLM,
     iteration: int,
@@ -963,10 +1144,11 @@ def run_pipeline(
         except Exception as e:
             print(f"  Analysis failed (non-fatal): {e}")
 
-        # Phase 4.5: Summary（纯 Python 累积日志，给人看）
+        # Phase 4.5: Summary（通过 SUMMARY_SKILL 驱动 agent 写 summary.md）
         try:
-            phase_summary(
-                iteration, workspace, result, best_score, best_iteration,
+            phase_summary_v2(
+                llm, iteration, workspace, result,
+                best_score, best_iteration, history,
                 task=task, base_model=base_model,
             )
         except Exception as e:
