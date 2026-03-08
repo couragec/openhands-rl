@@ -669,6 +669,102 @@ def build_analysis_prompt(
 """
 
 
+def phase_summary(
+    iteration: int,
+    workspace: str,
+    result: "IterationResult",
+    best_score: float | None,
+    best_iteration: int,
+    task: str = "",
+    base_model: str = "",
+) -> None:
+    """Phase 4.5: 纯 Python 累积日志，追加到 summary.md。
+
+    不调 LLM，零成本。给人看的逐轮记录。
+    """
+    ws = Path(workspace)
+    summary_path = ws / "summary.md"
+    code_path = Path(result.code_path) if result.code_path else ws / "code" / "train.py"
+
+    # ---- 检测训练类型和关键配置 ----
+    train_type = "unknown"
+    key_configs: list[str] = []
+    code_lines = 0
+    if code_path.exists():
+        code_text = code_path.read_text(errors="replace")
+        code_lines = len(code_text.splitlines())
+        if "GRPOTrainer" in code_text:
+            train_type = "GRPO"
+        elif "SFTTrainer" in code_text:
+            train_type = "SFT"
+        elif "PPOTrainer" in code_text:
+            train_type = "PPO"
+        elif "copytree" in code_text and "Trainer" not in code_text:
+            train_type = "copy_model"
+        elif "placeholder" in code_text or "manifest" in code_text:
+            train_type = "placeholder"
+
+        import re as _re
+        for pattern, label in [
+            (r"learning_rate\s*[=:]\s*([\d.e-]+)", "lr"),
+            (r"num_train_epochs\s*[=:]\s*(\d+)", "epochs"),
+            (r"max_steps\s*[=:]\s*(\d+)", "max_steps"),
+            (r"per_device_train_batch_size\s*[=:]\s*(\d+)", "batch"),
+            (r"lora_r\s*[=:]\s*(\d+)|LoraConfig\(r\s*=\s*(\d+)", "lora_r"),
+        ]:
+            m = _re.search(pattern, code_text)
+            if m:
+                val = m.group(1) or (m.group(2) if m.lastindex and m.lastindex >= 2 else "")
+                if val:
+                    key_configs.append(f"{label}={val}")
+
+    # ---- 训练状态 ----
+    if result.exit_code == 0:
+        status = "✅ 成功"
+    elif result.exit_code == -1:
+        status = "❌ 代码生成失败"
+    else:
+        status = f"❌ 训练失败 (exit_code={result.exit_code})"
+
+    # ---- 分数信息 ----
+    score_str = f"{result.score:.2f}" if result.score is not None else "—"
+    imp_str = f"{result.improvement:+.2f}" if result.improvement is not None else "—"
+    best_str = f"{best_score:.2f} (iter {best_iteration})" if best_score is not None else "—"
+
+    # ---- 构建 section ----
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    lines = [
+        f"\n## Iteration {iteration} | {ts} | 耗时 {result.training_time:.0f}s\n",
+        f"- **状态**: {status}",
+        f"- **Score**: {score_str} | Improvement: {imp_str} | Best: {best_str}",
+        f"- **train.py**: {code_lines} 行, {train_type}",
+    ]
+    if key_configs:
+        lines.append(f"- **关键配置**: {', '.join(key_configs)}")
+    if result.model_path:
+        lines.append(f"- **模型路径**: {result.model_path}")
+    if result.exit_code != 0 and result.stdout:
+        err_tail = result.stdout.strip().splitlines()[-3:]
+        lines.append(f"- **错误摘要**: `{'  '.join(e.strip() for e in err_tail)}`")
+    if result.analysis:
+        analysis_brief = result.analysis.strip().replace("\n", " ")[:200]
+        lines.append(f"- **Agent 分析**: {analysis_brief}")
+    lines.append("")
+
+    section = "\n".join(lines)
+
+    # ---- 追加到 summary.md ----
+    if not summary_path.exists():
+        header = f"# 运行总结\n\n> Task: {task} | Model: {base_model}\n> 自动生成，每轮追加\n"
+        summary_path.write_text(header + section, encoding="utf-8")
+    else:
+        with open(summary_path, "a", encoding="utf-8") as f:
+            f.write(section)
+
+    print(f"  Summary appended: {summary_path} (iteration {iteration})")
+
+
 def phase_analysis(
     llm: LLM,
     iteration: int,
@@ -866,6 +962,15 @@ def run_pipeline(
             result.analysis = analysis_text
         except Exception as e:
             print(f"  Analysis failed (non-fatal): {e}")
+
+        # Phase 4.5: Summary（纯 Python 累积日志，给人看）
+        try:
+            phase_summary(
+                iteration, workspace, result, best_score, best_iteration,
+                task=task, base_model=base_model,
+            )
+        except Exception as e:
+            print(f"  Summary failed (non-fatal): {e}")
 
         # Phase 5: Record
         history.append(result)
