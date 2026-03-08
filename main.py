@@ -519,12 +519,15 @@ def phase_code_generation(
         max_iteration_per_run=max_agent_steps,
     )
 
-    prompt = build_code_prompt(
-        iteration, workspace, base_model, task_description, history,
-        data_stats=data_stats, gpu_info=gpu_info,
-    )
-    conv.send_message(prompt)
-    run_with_retry(conv)
+    try:
+        prompt = build_code_prompt(
+            iteration, workspace, base_model, task_description, history,
+            data_stats=data_stats, gpu_info=gpu_info,
+        )
+        conv.send_message(prompt)
+        run_with_retry(conv)
+    finally:
+        conv.close()
 
     code_path = Path(workspace) / "code" / "train.py"
     if code_path.exists():
@@ -912,6 +915,7 @@ def phase_summary_v2(
     print(f"  Phase 4.5: Summary via Skill (iteration {iteration})")
     print(f"{'='*60}")
 
+    conv = None
     try:
         agent = create_summary_agent(llm)
         conv = Conversation(
@@ -944,6 +948,9 @@ def phase_summary_v2(
             best_score, best_iteration,
             task=task, base_model=base_model,
         )
+    finally:
+        if conv is not None:
+            conv.close()
 
 
 def phase_analysis(
@@ -969,34 +976,37 @@ def phase_analysis(
         max_iteration_per_run=10,
     )
 
-    prompt = build_analysis_prompt(
-        iteration, workspace, result, best_score, best_iteration,
-    )
-    conv.send_message(prompt)
-    run_with_retry(conv)
+    try:
+        prompt = build_analysis_prompt(
+            iteration, workspace, result, best_score, best_iteration,
+        )
+        conv.send_message(prompt)
+        run_with_retry(conv)
 
-    analysis_file = Path(workspace) / "analysis.md"
-    if analysis_file.exists():
-        analysis_text = analysis_file.read_text().strip()
-        if analysis_text:
-            print(f"  Analysis saved: {len(analysis_text)} chars")
-            return analysis_text
+        analysis_file = Path(workspace) / "analysis.md"
+        if analysis_file.exists():
+            analysis_text = analysis_file.read_text().strip()
+            if analysis_text:
+                print(f"  Analysis saved: {len(analysis_text)} chars")
+                return analysis_text
 
-    last_msg = ""
-    if hasattr(conv, "messages") and conv.messages:
-        for msg in reversed(conv.messages):
-            content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
-            if content and len(content) > 50:
-                last_msg = content
-                break
+        last_msg = ""
+        if hasattr(conv, "messages") and conv.messages:
+            for msg in reversed(conv.messages):
+                content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
+                if content and len(content) > 50:
+                    last_msg = content
+                    break
 
-    if last_msg:
-        analysis_file.write_text(last_msg)
-        print(f"  Analysis extracted from conversation: {len(last_msg)} chars")
-        return last_msg
+        if last_msg:
+            analysis_file.write_text(last_msg)
+            print(f"  Analysis extracted from conversation: {len(last_msg)} chars")
+            return last_msg
 
-    print("  WARNING: No analysis produced")
-    return ""
+        print("  WARNING: No analysis produced")
+        return ""
+    finally:
+        conv.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1099,6 +1109,7 @@ def run_pipeline(
             if exit_code == 0:
                 break
             print(f"\n  --- Fix retry {retry + 1}/{max_fix_retries} ---")
+            fix_conv = None
             try:
                 fix_prompt = build_fix_prompt(code_path, stdout, data_path, workspace)
                 fix_agent = create_code_agent(create_llm())
@@ -1112,6 +1123,9 @@ def run_pipeline(
             except Exception as e:
                 print(f"  Fix agent failed: {e}")
                 break
+            finally:
+                if fix_conv is not None:
+                    fix_conv.close()
 
             exit_code, stdout, extra_time = phase_training(
                 workspace, code_path, timeout=training_timeout,
